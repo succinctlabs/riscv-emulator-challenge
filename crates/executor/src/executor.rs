@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use hashbrown::{hash_map::Entry, HashMap};
+use hashbrown::HashMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -103,10 +103,12 @@ pub enum ExecutionError {
     HaltWithNonZeroExitCode(u32),
 
     /// The execution failed with an invalid memory access.
+    /// The execution failed due to insufficient input data.
     #[error("invalid memory access for opcode {0} and address {1}")]
     InvalidMemoryAccess(Opcode, u32),
 
     /// The execution failed with an unimplemented syscall.
+    /// The execution failed due to an invalid syscall usage in unconstrained mode.
     #[error("unimplemented syscall {0}")]
     UnsupportedSyscall(u32),
 
@@ -227,82 +229,86 @@ impl<'a> Executor<'a> {
     #[must_use]
     pub fn registers(&mut self) -> [u32; 32] {
         let mut registers = [0; 32];
-        for i in 0..32 {
-            let addr = Register::from_u32(i as u32) as u32;
-            let record = self.state.memory.get(&addr);
-
-            // Only add the previous memory state to checkpoint map if we're in checkpoint mode,
-            // or if we're in unconstrained mode. In unconstrained mode, the mode is always
-            // Simple.
-            if self.executor_mode == ExecutorMode::Checkpoint || self.unconstrained {
-                match record {
-                    Some(record) => {
-                        self.memory_checkpoint
-                            .entry(addr)
-                            .or_insert_with(|| Some(*record));
-                    }
-                    None => {
-                        self.memory_checkpoint.entry(addr).or_insert(None);
-                    }
-                }
-            }
-
-            registers[i] = match record {
-                Some(record) => record.value,
-                None => 0,
-            };
+        
+        // Copy hot registers (0-7)
+        for i in 0..8 {
+            registers[i] = self.state.get_register(i).value;
         }
+        
+        // Copy cold registers (8-31)
+        for i in 8..32 {
+            registers[i] = self.state.get_register(i).value;
+        }
+        
         registers
     }
 
     /// Get the current value of a register.
     #[must_use]
     pub fn register(&mut self, register: Register) -> u32 {
-        let addr = register as u32;
-        let record = self.state.memory.get(&addr);
-
-        if self.executor_mode == ExecutorMode::Checkpoint || self.unconstrained {
-            match record {
-                Some(record) => {
-                    self.memory_checkpoint
-                        .entry(addr)
-                        .or_insert_with(|| Some(*record));
-                }
-                None => {
-                    self.memory_checkpoint.entry(addr).or_insert(None);
-                }
-            }
-        }
-
-        match record {
-            Some(record) => record.value,
-            None => 0,
-        }
+        let reg_idx = register as usize;
+        self.state.get_register(reg_idx).value
     }
 
-    /// Get the current value of a word.
+    /// Get the current value of a word with enhanced memory optimizations.
     #[must_use]
     pub fn word(&mut self, addr: u32) -> u32 {
-        #[allow(clippy::single_match_else)]
-        let record = self.state.memory.get(&addr);
+        // Record memory access for pattern detection and prefetching
+        self.state.memory_access_patterns.record_access(addr);
 
-        if self.executor_mode == ExecutorMode::Checkpoint || self.unconstrained {
-            match record {
-                Some(record) => {
+        // Try prefetch buffer first
+        if let Some(record) = self.state.prefetch_buffer.lookup(addr) {
+            return record.value;
+        }
+
+        // Get from main memory
+        let value = match self.state.get_memory(addr) {
+            Some(record) => {
+                // Add to prefetch buffer
+                self.state.prefetch_buffer.insert(addr, *record);
+                
+                // Get predicted addresses from all predictors
+                let predicted_addrs = self.state.memory_access_patterns.predict_next_access(addr);
+
+                // Prefetch predicted addresses
+                for next_addr in predicted_addrs {
+                    if next_addr % 4 == 0 {  // Ensure alignment
+                        if let Some(next_record) = self.state.get_memory(next_addr) {
+                            self.state.prefetch_buffer.insert(next_addr, *next_record);
+                        }
+                    }
+                }
+
+                // Handle checkpointing
+                if self.executor_mode == ExecutorMode::Checkpoint || self.unconstrained {
                     self.memory_checkpoint
                         .entry(addr)
                         .or_insert_with(|| Some(*record));
                 }
-                None => {
+
+                record.value
+            }
+            None => {
+                // Handle checkpointing for non-existent addresses
+                if self.executor_mode == ExecutorMode::Checkpoint || self.unconstrained {
                     self.memory_checkpoint.entry(addr).or_insert(None);
+                }
+                0
+            }
+        };
+
+        // Prefetch next sequential cache line if not already in buffer
+        let next_line_addr = (addr & !(SPATIAL_REGION_SIZE as u32 - 1)) + SPATIAL_REGION_SIZE as u32;
+        for offset in (0..SPATIAL_REGION_SIZE).step_by(4) {
+            let prefetch_addr = next_line_addr + offset as u32;
+            if self.state.prefetch_buffer.lookup(prefetch_addr).is_none() {
+                if let Some(next_record) = self.state.get_memory(prefetch_addr) {
+                    self.state.prefetch_buffer.insert(prefetch_addr, *next_record);
                 }
             }
         }
 
-        match record {
-            Some(record) => record.value,
-            None => 0,
-        }
+        value
     }
 
     /// Get the current value of a byte.
@@ -333,76 +339,77 @@ impl<'a> Executor<'a> {
         timestamp: u32,
         local_memory_access: Option<&mut HashMap<u32, MemoryLocalEvent>>,
     ) -> MemoryReadRecord {
-        // Get the memory record entry.
-        let entry = self.state.memory.entry(addr);
-        if self.executor_mode == ExecutorMode::Checkpoint || self.unconstrained {
-            match entry {
-                Entry::Occupied(ref entry) => {
-                    let record = entry.get();
-                    self.memory_checkpoint
+        // Try prefetch buffer first
+        let prev_record = if let Some(record) = self.state.prefetch_buffer.lookup(addr) {
+            *record
+        } else {
+            // Get current record or create new one
+            let record = self.state.get_memory(addr)
+                .copied()
+                .unwrap_or_else(|| {
+                    let value = self.state.uninitialized_memory.get(&addr).unwrap_or(&0);
+                    self.uninitialized_memory_checkpoint
                         .entry(addr)
-                        .or_insert_with(|| Some(*record));
-                }
-                Entry::Vacant(_) => {
-                    self.memory_checkpoint.entry(addr).or_insert(None);
+                        .or_insert_with(|| *value != 0);
+                    MemoryRecord {
+                        value: *value,
+                        shard: 0,
+                        timestamp: 0,
+                    }
+                });
+
+            // Add to prefetch buffer and predict next access
+            self.state.prefetch_buffer.insert(addr, record);
+            if let Some(next_addr) = self.state.stride_predictor.predict_next_addr(addr) {
+                if next_addr % 4 == 0 {
+                    if let Some(next_record) = self.state.get_memory(next_addr) {
+                        self.state.prefetch_buffer.insert(next_addr, *next_record);
+                    }
                 }
             }
-        }
-
-        // If we're in unconstrained mode, we don't want to modify state, so we'll save the
-        // original state if it's the first time modifying it.
-        if self.unconstrained {
-            let record = match entry {
-                Entry::Occupied(ref entry) => Some(entry.get()),
-                Entry::Vacant(_) => None,
-            };
-            self.unconstrained_state
-                .memory_diff
-                .entry(addr)
-                .or_insert(record.copied());
-        }
-
-        // If it's the first time accessing this address, initialize previous values.
-        let record: &mut MemoryRecord = match entry {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                // If addr has a specific value to be initialized with, use that, otherwise 0.
-                let value = self.state.uninitialized_memory.get(&addr).unwrap_or(&0);
-                self.uninitialized_memory_checkpoint
-                    .entry(addr)
-                    .or_insert_with(|| *value != 0);
-                entry.insert(MemoryRecord {
-                    value: *value,
-                    shard: 0,
-                    timestamp: 0,
-                })
-            }
+            
+            record
         };
 
-        let prev_record = *record;
+        // Create new record
+        let mut record = prev_record;
         record.shard = shard;
         record.timestamp = timestamp;
 
-        if !self.unconstrained {
-            let local_memory_access = if let Some(local_memory_access) = local_memory_access {
-                local_memory_access
-            } else {
-                &mut self.local_memory_access
-            };
+        // Update memory
+        self.state.set_memory(addr, record);
 
+        // Handle checkpointing
+        if self.executor_mode == ExecutorMode::Checkpoint || self.unconstrained {
+            self.memory_checkpoint
+                .entry(addr)
+                .or_insert_with(|| Some(prev_record));
+        }
+
+        // Handle unconstrained mode
+        if self.unconstrained {
+            self.unconstrained_state
+                .memory_diff
+                .entry(addr)
+                .or_insert_with(|| Some(prev_record));
+        }
+
+        // Update local memory access
+        if !self.unconstrained {
+            let local_memory_access = local_memory_access.unwrap_or(&mut self.local_memory_access);
             local_memory_access
                 .entry(addr)
                 .and_modify(|e| {
-                    e.final_mem_access = *record;
+                    e.final_mem_access = record;
                 })
                 .or_insert(MemoryLocalEvent {
                     addr,
                     initial_mem_access: prev_record,
-                    final_mem_access: *record,
+                    final_mem_access: record,
                 });
         }
 
-        // Construct the memory read record.
+        // Return read record
         MemoryReadRecord::new(
             record.value,
             record.shard,
@@ -421,78 +428,61 @@ impl<'a> Executor<'a> {
         timestamp: u32,
         local_memory_access: Option<&mut HashMap<u32, MemoryLocalEvent>>,
     ) -> MemoryWriteRecord {
-        // Get the memory record entry.
-        let entry = self.state.memory.entry(addr);
-        if self.executor_mode == ExecutorMode::Checkpoint || self.unconstrained {
-            match entry {
-                Entry::Occupied(ref entry) => {
-                    let record = entry.get();
-                    self.memory_checkpoint
-                        .entry(addr)
-                        .or_insert_with(|| Some(*record));
-                }
-                Entry::Vacant(_) => {
-                    self.memory_checkpoint.entry(addr).or_insert(None);
-                }
-            }
-        }
-
-        // If we're in unconstrained mode, we don't want to modify state, so we'll save the
-        // original state if it's the first time modifying it.
-        if self.unconstrained {
-            let record = match entry {
-                Entry::Occupied(ref entry) => Some(entry.get()),
-                Entry::Vacant(_) => None,
-            };
-            self.unconstrained_state
-                .memory_diff
-                .entry(addr)
-                .or_insert(record.copied());
-        }
-
-        // If it's the first time accessing this address, initialize previous values.
-        let record: &mut MemoryRecord = match entry {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                // If addr has a specific value to be initialized with, use that, otherwise 0.
-                let value = self.state.uninitialized_memory.get(&addr).unwrap_or(&0);
+        // Get current record or create new one
+        let prev_record = self.state.get_memory(addr)
+            .copied()
+            .unwrap_or_else(|| {
+                let init_value = self.state.uninitialized_memory.get(&addr).unwrap_or(&0);
                 self.uninitialized_memory_checkpoint
                     .entry(addr)
-                    .or_insert_with(|| *value != 0);
-
-                entry.insert(MemoryRecord {
-                    value: *value,
+                    .or_insert_with(|| *init_value != 0);
+                MemoryRecord {
+                    value: *init_value,
                     shard: 0,
                     timestamp: 0,
-                })
-            }
-        };
+                }
+            });
 
-        let prev_record = *record;
+        // Create new record
+        let mut record = prev_record;
         record.value = value;
         record.shard = shard;
         record.timestamp = timestamp;
 
-        if !self.unconstrained {
-            let local_memory_access = if let Some(local_memory_access) = local_memory_access {
-                local_memory_access
-            } else {
-                &mut self.local_memory_access
-            };
+        // Update memory
+        self.state.set_memory(addr, record);
 
+        // Handle checkpointing
+        if self.executor_mode == ExecutorMode::Checkpoint || self.unconstrained {
+            self.memory_checkpoint
+                .entry(addr)
+                .or_insert_with(|| Some(prev_record));
+        }
+
+        // Handle unconstrained mode
+        if self.unconstrained {
+            self.unconstrained_state
+                .memory_diff
+                .entry(addr)
+                .or_insert_with(|| Some(prev_record));
+        }
+
+        // Update local memory access
+        if !self.unconstrained {
+            let local_memory_access = local_memory_access.unwrap_or(&mut self.local_memory_access);
             local_memory_access
                 .entry(addr)
                 .and_modify(|e| {
-                    e.final_mem_access = *record;
+                    e.final_mem_access = record;
                 })
                 .or_insert(MemoryLocalEvent {
                     addr,
                     initial_mem_access: prev_record,
-                    final_mem_access: *record,
+                    final_mem_access: record,
                 });
         }
 
-        // Construct the memory write record.
+        // Return write record
         MemoryWriteRecord::new(
             record.value,
             record.shard,
@@ -530,19 +520,63 @@ impl<'a> Executor<'a> {
 
     /// Read from a register.
     pub fn rr(&mut self, register: Register, position: MemoryAccessPosition) -> u32 {
-        self.mr_cpu(register as u32, position)
+        // Record register access for optimization
+        self.state.register_allocator.record_access(register, self.state.pc, false);
+
+        let reg_idx = register as usize;
+        let value = if self.state.register_allocator.should_spill(register) {
+            // Register is spilled - load from memory
+            let spill_addr = self.get_spill_address(register);
+            match self.state.get_memory(spill_addr) {
+                Some(record) => record.value,
+                None => 0,
+            }
+        } else {
+            // Register is in hot/cold storage
+            if reg_idx < 8 {
+                self.state.hot_registers[reg_idx].value
+            } else {
+                self.state.cold_registers[reg_idx - 8].value
+            }
+        };
+
+        value
     }
 
     /// Write to a register.
     pub fn rw(&mut self, register: Register, value: u32) {
-        // The only time we are writing to a register is when it is in operand A.
-        // Register %x0 should always be 0. See 2.6 Load and Store Instruction on
-        // P.18 of the RISC-V spec. We always write 0 to %x0.
-        if register == Register::X0 {
-            self.mw_cpu(register as u32, 0, MemoryAccessPosition::A);
+        // Record register write for optimization
+        self.state.register_allocator.record_access(register, self.state.pc, true);
+        
+        // Register %x0 should always be 0
+        let value = if register == Register::X0 { 0 } else { value };
+        
+        let record = MemoryRecord {
+            value,
+            shard: self.shard(),
+            timestamp: self.timestamp(&MemoryAccessPosition::A),
+        };
+
+        let reg_idx = register as usize;
+        if self.state.register_allocator.should_spill(register) {
+            // Register is spilled - store to memory
+            let spill_addr = self.get_spill_address(register);
+            self.state.set_memory(spill_addr, record);
         } else {
-            self.mw_cpu(register as u32, value, MemoryAccessPosition::A);
+            // Register is in hot/cold storage
+            if reg_idx < 8 {
+                self.state.hot_registers[reg_idx] = record;
+            } else {
+                self.state.cold_registers[reg_idx - 8] = record;
+            }
         }
+    }
+
+    /// Get memory address for spilled register
+    fn get_spill_address(&self, register: Register) -> u32 {
+        // Use high memory addresses for spilled registers
+        // Start at 0xFFFF_0000 and offset by register number
+        0xFFFF_0000 + ((register as u32) * 4)
     }
 
     /// Fetch the destination register and input operand values for an ALU instruction.
@@ -603,23 +637,40 @@ impl<'a> Executor<'a> {
 
     /// Fetch the instruction at the current program counter.
     #[inline]
-    fn fetch(&self) -> Instruction {
+    fn fetch(&mut self) -> Instruction {
+        // Try instruction cache first
+        if let Some(instruction) = self.state.icache.lookup(self.state.pc) {
+            return instruction;
+        }
+
+        // Cache miss - fetch from program memory and update cache
         let idx = ((self.state.pc - self.program.pc_base) / 4) as usize;
-        self.program.instructions[idx]
+        let instruction = self.program.instructions[idx];
+        self.state.icache.insert(self.state.pc, instruction);
+        instruction
     }
 
-    /// Execute the given instruction over the current state of the runtime.
-    #[allow(clippy::too_many_lines)]
-    fn execute_instruction(&mut self, instruction: &Instruction) -> Result<(), ExecutionError> {
+    /// Execute a single instruction without scheduling
+    #[inline]
+    fn execute_single_instruction(&mut self, instruction: &Instruction) -> Result<(), ExecutionError> {
         let mut next_pc = self.state.pc.wrapping_add(4);
+        let current_pc = self.state.pc;
+        
+        // Get branch prediction
+        let (predicted_taken, predicted_target) = self.state.branch_predictor.predict(current_pc, instruction.opcode);
+        
+        // If we have a predicted target, use it for speculative execution
+        if predicted_taken {
+            if let Some(target) = predicted_target {
+                next_pc = target;
+            }
+        }
 
         let rd: Register;
         let (a, b, c): (u32, u32, u32);
         let (addr, memory_read_value): (u32, u32);
 
-        if self.executor_mode == ExecutorMode::Trace {
-            // self.memory_accesses = MemoryAccessRecord::default();
-        }
+        // Initialize lookup IDs for tracing
         let lookup_id = if self.executor_mode == ExecutorMode::Trace {
             create_alu_lookup_id()
         } else {
@@ -631,6 +682,7 @@ impl<'a> Executor<'a> {
             LookupId::default()
         };
 
+        // Execute the actual instruction
         match instruction.opcode {
             // Arithmetic instructions.
             Opcode::ADD => {
@@ -765,57 +817,69 @@ impl<'a> Executor<'a> {
                 self.mw_cpu(align(addr), value, MemoryAccessPosition::Memory);
             }
 
-            // B-type instructions.
+            // B-type instructions with enhanced branch prediction
             Opcode::BEQ => {
                 (a, b, c) = self.branch_rr(instruction);
-                if a == b {
-                    next_pc = self.state.pc.wrapping_add(c);
-                }
+                let taken = a == b;
+                let target_pc = if taken { current_pc.wrapping_add(c) } else { next_pc };
+                self.state.branch_predictor.update(current_pc, instruction.opcode, taken, target_pc);
+                next_pc = target_pc;
             }
             Opcode::BNE => {
                 (a, b, c) = self.branch_rr(instruction);
-                if a != b {
-                    next_pc = self.state.pc.wrapping_add(c);
-                }
+                let taken = a != b;
+                let target_pc = if taken { current_pc.wrapping_add(c) } else { next_pc };
+                self.state.branch_predictor.update(current_pc, instruction.opcode, taken, target_pc);
+                next_pc = target_pc;
             }
             Opcode::BLT => {
                 (a, b, c) = self.branch_rr(instruction);
-                if (a as i32) < (b as i32) {
-                    next_pc = self.state.pc.wrapping_add(c);
-                }
+                let taken = (a as i32) < (b as i32);
+                let target_pc = if taken { current_pc.wrapping_add(c) } else { next_pc };
+                self.state.branch_predictor.update(current_pc, instruction.opcode, taken, target_pc);
+                next_pc = target_pc;
             }
             Opcode::BGE => {
                 (a, b, c) = self.branch_rr(instruction);
-                if (a as i32) >= (b as i32) {
-                    next_pc = self.state.pc.wrapping_add(c);
-                }
+                let taken = (a as i32) >= (b as i32);
+                let target_pc = if taken { current_pc.wrapping_add(c) } else { next_pc };
+                self.state.branch_predictor.update(current_pc, instruction.opcode, taken, target_pc);
+                next_pc = target_pc;
             }
             Opcode::BLTU => {
                 (a, b, c) = self.branch_rr(instruction);
-                if a < b {
-                    next_pc = self.state.pc.wrapping_add(c);
-                }
+                let taken = a < b;
+                let target_pc = if taken { current_pc.wrapping_add(c) } else { next_pc };
+                self.state.branch_predictor.update(current_pc, instruction.opcode, taken, target_pc);
+                next_pc = target_pc;
             }
             Opcode::BGEU => {
                 (a, b, c) = self.branch_rr(instruction);
-                if a >= b {
-                    next_pc = self.state.pc.wrapping_add(c);
-                }
+                let taken = a >= b;
+                let target_pc = if taken { current_pc.wrapping_add(c) } else { next_pc };
+                self.state.branch_predictor.update(current_pc, instruction.opcode, taken, target_pc);
+                next_pc = target_pc;
             }
 
-            // Jump instructions.
+            // Jump instructions with return address stack
             Opcode::JAL => {
                 let (rd, imm) = instruction.j_type();
                 a = self.state.pc + 4;
                 self.rw(rd, a);
-                next_pc = self.state.pc.wrapping_add(imm);
+                let target_pc = self.state.pc.wrapping_add(imm);
+                // Update branch predictor with JAL target and return address
+                self.state.branch_predictor.update(current_pc, instruction.opcode, true, target_pc);
+                next_pc = target_pc;
             }
             Opcode::JALR => {
                 let (rd, rs1, imm) = instruction.i_type();
                 (b, c) = (self.rr(rs1, MemoryAccessPosition::B), imm);
                 a = self.state.pc + 4;
                 self.rw(rd, a);
-                next_pc = b.wrapping_add(c);
+                let target_pc = b.wrapping_add(c);
+                // Update branch predictor with JALR target and return address
+                self.state.branch_predictor.update(current_pc, instruction.opcode, true, target_pc);
+                next_pc = target_pc;
             }
 
             // Upper immediate instructions.
@@ -861,10 +925,27 @@ impl<'a> Executor<'a> {
                     .or_insert(0);
                 *syscall_count += 1;
 
-                let syscall_impl = self.get_syscall(syscall).cloned();
+                // Record syscall for optimization tracking
+                self.state.syscall_stats.record_syscall(syscall);
+
+                // Try syscall cache first for hot syscalls
+                let syscall_impl = if self.state.syscall_stats.is_hot_syscall(syscall) {
+                    // Hot syscall path - always use cache
+                    self.state.syscall_cache.lookup(syscall)
+                        .or_else(|| {
+                            let impl_arc = self.get_syscall(syscall).cloned()?;
+                            self.state.syscall_cache.insert(syscall, impl_arc.clone());
+                            Some(impl_arc)
+                        })
+                } else {
+                    // Cold syscall path - bypass cache to avoid cache pollution
+                    self.get_syscall(syscall).cloned()
+                };
+
                 if syscall.should_send() != 0 {
                     // self.emit_syscall(clk, syscall.syscall_id(), b, c, syscall_lookup_id);
                 }
+
                 let mut precompile_rt = SyscallContext::new(self);
                 precompile_rt.syscall_lookup_id = syscall_lookup_id;
                 let (precompile_next_pc, precompile_cycles, _) =
@@ -976,24 +1057,72 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
+    /// Execute the given instruction over the current state of the runtime.
+    #[allow(clippy::too_many_lines)]
+    #[inline]
+    fn execute_instruction(&mut self, instruction: &Instruction) -> Result<(), ExecutionError> {
+        // Try to schedule instructions
+        let ready_instructions = self.state.scheduler.add_instruction(*instruction);
+        
+        // Execute all ready instructions
+        for inst in ready_instructions {
+            self.execute_single_instruction(&inst)?;
+            self.state.scheduler.complete_instruction(&inst);
+        }
+        
+        // Update global clock based on instruction latency
+        self.state.clk += self.state.scheduler.get_latency(instruction.opcode);
+        
+        Ok(())
+    }
+
     /// Executes one cycle of the program, returning whether the program has finished.
     #[inline]
     #[allow(clippy::too_many_lines)]
     fn execute_cycle(&mut self) -> Result<bool, ExecutionError> {
-        // Fetch the instruction at the current program counter.
+        let current_pc = self.state.pc;
+        
+        // Record PC for loop detection
+        self.state.loop_tracker.record_pc(current_pc);
+
+        // Fetch the instruction at the current program counter
         let instruction = self.fetch();
 
-        // Log the current state of the runtime.
+        // Log the current state of the runtime in debug mode
         #[cfg(debug_assertions)]
         self.log(&instruction);
 
-        // Execute the instruction.
-        self.execute_instruction(&instruction)?;
+        // Check for loop optimization opportunities
+        if let Some(loop_info) = self.state.loop_tracker.get_loop_info(current_pc) {
+            if current_pc == loop_info.start_pc {
+                // Start new loop execution
+                self.state.loop_tracker.start_loop(loop_info.clone());
+                
+                if loop_info.vectorizable {
+                    // Execute vectorized loop
+                    if let Ok(()) = self.execute_vectorized_loop(&loop_info) {
+                        return Ok(false);
+                    }
+                } else if loop_info.unroll_factor > 1 {
+                    // Execute unrolled loop
+                    if let Ok(()) = self.execute_unrolled_loop(&loop_info) {
+                        return Ok(false);
+                    }
+                }
+            } else if current_pc == loop_info.end_pc {
+                // End of loop iteration
+                self.state.loop_tracker.end_loop();
+            }
+        }
 
-        // Increment the clock.
+        // Execute single instruction
+        self.execute_instruction(&instruction)?;
         self.state.global_clk += 1;
 
-        // If the cycle limit is exceeded, return an error.
+        // Record instruction for loop analysis
+        self.state.loop_tracker.record_pc(self.state.pc);
+
+        // Check cycle limit
         if let Some(max_cycles) = self.max_cycles {
             if self.state.global_clk >= max_cycles {
                 return Err(ExecutionError::ExceededCycleLimit(max_cycles));
